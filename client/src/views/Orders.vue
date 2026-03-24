@@ -27,9 +27,47 @@
         </div>
       </div>
 
+      <!-- Submitted Orders: restocking orders placed via the Restocking tab -->
+      <div v-if="submittedOrders.length > 0" class="card" style="margin-bottom: 1.25rem;">
+        <div class="card-header">
+          <span class="card-title">Submitted Orders</span>
+          <span style="font-size: 0.875rem; color: #64748b;">Restocking orders placed via the Restocking tab</span>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Submitted</th>
+                <th>Est. Delivery</th>
+                <th>Items</th>
+                <th>Total Value</th>
+                <th>Lead Time</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="order in submittedOrders" :key="order.id">
+                <td style="font-weight: 600; color: #0f172a;">{{ order.order_number }}</td>
+                <td>{{ formatDate(order.order_date) }}</td>
+                <td>{{ formatDate(order.expected_delivery) }}</td>
+                <td>{{ order.items.length }} item{{ order.items.length !== 1 ? 's' : '' }}</td>
+                <td>{{ formatCurrency(order.total_value) }}</td>
+                <td>
+                  <!-- Lead time: days between order_date and expected_delivery -->
+                  {{ getLeadTimeDays(order.order_date, order.expected_delivery) }} days
+                </td>
+                <td><span class="badge warning">Processing</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Regular customer orders -->
       <div class="card">
         <div class="card-header">
-          <h3 class="card-title">{{ t('orders.allOrders') }} ({{ orders.length }})</h3>
+          <h3 class="card-title">{{ t('orders.allOrders') }} ({{ regularOrders.length }})</h3>
         </div>
         <div class="table-container">
           <table class="orders-table">
@@ -45,7 +83,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-for="order in orders" :key="order.id">
+              <tr v-for="order in regularOrders" :key="order.id">
                 <td class="col-order-number"><strong>{{ order.order_number }}</strong></td>
                 <td class="col-customer">{{ translateCustomerName(order.customer) }}</td>
                 <td class="col-items">
@@ -94,7 +132,8 @@ export default {
     })
     const loading = ref(true)
     const error = ref(null)
-    const orders = ref([])
+    // All orders fetched from the API (regular customer orders + restocking orders)
+    const allOrders = ref([])
 
     // Use shared filters
     const {
@@ -112,7 +151,7 @@ export default {
         const fetchedOrders = await api.getOrders(filters)
 
         // Sort orders by order_date (earliest first)
-        orders.value = fetchedOrders.sort((a, b) => {
+        allOrders.value = fetchedOrders.sort((a, b) => {
           const dateA = new Date(a.order_date)
           const dateB = new Date(b.order_date)
           return dateA - dateB
@@ -129,8 +168,15 @@ export default {
       loadOrders()
     })
 
+    // Regular customer orders — excludes restocking orders placed via the Restocking tab
+    const regularOrders = computed(() => allOrders.value.filter(o => o.source !== 'restocking'))
+
+    // Restocking orders submitted via the Restocking tab
+    const submittedOrders = computed(() => allOrders.value.filter(o => o.source === 'restocking'))
+
+    // Stat cards count only regular orders (restocking orders have their own section)
     const getOrdersByStatus = (status) => {
-      return orders.value.filter(order => order.status === status)
+      return regularOrders.value.filter(order => order.status === status)
     }
 
     const getOrderStatusClass = (status) => {
@@ -146,11 +192,26 @@ export default {
     const formatDate = (dateString) => {
       const { currentLocale } = useI18n()
       const locale = currentLocale.value === 'ja' ? 'ja-JP' : 'en-US'
-      return new Date(dateString).toLocaleDateString(locale, {
+      const date = new Date(dateString)
+      if (isNaN(date.getTime())) return '—'
+      return date.toLocaleDateString(locale, {
         year: 'numeric',
         month: 'short',
         day: 'numeric'
       })
+    }
+
+    // Calculate whole days between two ISO date strings
+    const getLeadTimeDays = (startIso, endIso) => {
+      const start = new Date(startIso)
+      const end = new Date(endIso)
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) return '—'
+      return Math.round((end - start) / (1000 * 60 * 60 * 24))
+    }
+
+    // Format a numeric value as currency using the active currency symbol
+    const formatCurrency = (value) => {
+      return `${currencySymbol.value}${Number(value).toLocaleString()}`
     }
 
     onMounted(loadOrders)
@@ -159,10 +220,14 @@ export default {
       t,
       loading,
       error,
-      orders,
+      allOrders,
+      regularOrders,
+      submittedOrders,
       getOrdersByStatus,
       getOrderStatusClass,
       formatDate,
+      getLeadTimeDays,
+      formatCurrency,
       currencySymbol,
       translateProductName,
       translateCustomerName

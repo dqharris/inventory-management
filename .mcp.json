@@ -2,21 +2,39 @@
   "mcpServers": {
     "playwright": {
       "type": "stdio",
-      "command": "npx",
+      "command": "/Users/dalton.harris/.nvm/versions/node/v24.14.0/bin/npx",
       "args": [
         "-y",
         "@playwright/mcp@0.0.37"
       ],
-      "env": {}
+      "env": {
+        "PATH": "/Users/dalton.harris/.nvm/versions/node/v24.14.0/bin:/Users/dalton.harris/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+      }
+    },
+    "snyk": {
+      "type": "stdio",
+      "command": "/Users/dalton.harris/.nvm/versions/node/v24.14.0/bin/npx",
+      "args": [
+        "-y",
+        "snyk@latest",
+        "mcp",
+        "-t",
+        "stdio"
+      ],
+      "env": {
+        "PATH": "/Users/dalton.harris/.nvm/versions/node/v24.14.0/bin:/Users/dalton.harris/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "SNYK_TOKEN": "${SNYK_TOKEN}"
+      }
     },
     "github": {
       "type": "stdio",
-      "command": "npx",
+      "command": "/Users/dalton.harris/.nvm/versions/node/v24.14.0/bin/npx",
       "args": [
         "-y",
         "@modelcontextprotocol/server-github"
       ],
       "env": {
+        "PATH": "/Users/dalton.harris/.nvm/versions/node/v24.14.0/bin:/Users/dalton.harris/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
       }
     }
