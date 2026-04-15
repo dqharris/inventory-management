@@ -1,6 +1,11 @@
 import os
-from fastapi import FastAPI, HTTPException
+import logging
+import time
+from enum import Enum
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
@@ -15,6 +20,32 @@ QUARTER_MAP = {
     'Q3-2025': ['2025-07', '2025-08', '2025-09'],
     'Q4-2025': ['2025-10', '2025-11', '2025-12']
 }
+
+# --- Input validation: Enum types for query parameters (CWE-20) ---
+class WarehouseFilter(str, Enum):
+    all = "all"
+    london = "London"
+    san_francisco = "San Francisco"
+    tokyo = "Tokyo"
+
+class CategoryFilter(str, Enum):
+    all = "all"
+    actuators = "Actuators"
+    circuit_boards = "Circuit Boards"
+    controllers = "Controllers"
+    power_supplies = "Power Supplies"
+    sensors = "Sensors"
+
+class StatusFilter(str, Enum):
+    all = "all"
+    backordered = "Backordered"
+    delivered = "Delivered"
+    processing = "Processing"
+    shipped = "Shipped"
+
+# Month parameter: accepts 'all', 'YYYY-MM', or 'Qn-YYYY' format only
+MONTH_PATTERN = r"^(all|Q[1-4]-\d{4}|\d{4}-(0[1-9]|1[0-2]))$"
+
 
 def filter_by_month(items: list, month: Optional[str]) -> list:
     """Filter items by month/quarter based on order_date field"""
@@ -58,9 +89,56 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization", "Accept"],
 )
+
+# Security headers middleware (CWE-693)
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+            "object-src 'none'; frame-ancestors 'none'"
+        )
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+        response.headers["X-XSS-Protection"] = "0"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=(), payment=()"
+        )
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Audit logging middleware (CWE-200 - traceability)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+audit_logger = logging.getLogger("audit")
+
+class AuditLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        start = time.monotonic()
+        response = await call_next(request)
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+        audit_logger.info(
+            "%s %s status=%d client=%s elapsed_ms=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            request.client.host if request.client else "unknown",
+            elapsed_ms,
+        )
+        return response
+
+app.add_middleware(AuditLogMiddleware)
 
 # Data models
 class InventoryItem(BaseModel):
@@ -143,15 +221,19 @@ class CreatePurchaseOrderRequest(BaseModel):
 # API endpoints
 @app.get("/")
 def root():
-    return {"message": "Factory Inventory Management System API", "version": "1.0.0"}
+    return {"message": "Factory Inventory Management System API"}
 
 @app.get("/api/inventory", response_model=List[InventoryItem])
 def get_inventory(
-    warehouse: Optional[str] = None,
-    category: Optional[str] = None
+    warehouse: Optional[WarehouseFilter] = None,
+    category: Optional[CategoryFilter] = None
 ):
     """Get all inventory items with optional filtering"""
-    return apply_filters(inventory_items, warehouse, category)
+    return apply_filters(
+        inventory_items,
+        warehouse.value if warehouse else None,
+        category.value if category else None
+    )
 
 @app.get("/api/inventory/{item_id}", response_model=InventoryItem)
 def get_inventory_item(item_id: str):
@@ -163,13 +245,18 @@ def get_inventory_item(item_id: str):
 
 @app.get("/api/orders", response_model=List[Order])
 def get_orders(
-    warehouse: Optional[str] = None,
-    category: Optional[str] = None,
-    status: Optional[str] = None,
-    month: Optional[str] = None
+    warehouse: Optional[WarehouseFilter] = None,
+    category: Optional[CategoryFilter] = None,
+    status: Optional[StatusFilter] = None,
+    month: Optional[str] = Query(default=None, pattern=MONTH_PATTERN)
 ):
     """Get all orders with optional filtering"""
-    filtered_orders = apply_filters(orders, warehouse, category, status)
+    filtered_orders = apply_filters(
+        orders,
+        warehouse.value if warehouse else None,
+        category.value if category else None,
+        status.value if status else None
+    )
     filtered_orders = filter_by_month(filtered_orders, month)
     return filtered_orders
 
@@ -210,17 +297,26 @@ def get_backlog():
 
 @app.get("/api/dashboard/summary")
 def get_dashboard_summary(
-    warehouse: Optional[str] = None,
-    category: Optional[str] = None,
-    status: Optional[str] = None,
-    month: Optional[str] = None
+    warehouse: Optional[WarehouseFilter] = None,
+    category: Optional[CategoryFilter] = None,
+    status: Optional[StatusFilter] = None,
+    month: Optional[str] = Query(default=None, pattern=MONTH_PATTERN)
 ):
     """Get summary statistics for dashboard with optional filtering"""
     # Filter inventory
-    filtered_inventory = apply_filters(inventory_items, warehouse, category)
+    filtered_inventory = apply_filters(
+        inventory_items,
+        warehouse.value if warehouse else None,
+        category.value if category else None
+    )
 
     # Filter orders
-    filtered_orders = apply_filters(orders, warehouse, category, status)
+    filtered_orders = apply_filters(
+        orders,
+        warehouse.value if warehouse else None,
+        category.value if category else None,
+        status.value if status else None
+    )
     filtered_orders = filter_by_month(filtered_orders, month)
 
     total_inventory_value = sum(item["quantity_on_hand"] * item["unit_cost"] for item in filtered_inventory)
