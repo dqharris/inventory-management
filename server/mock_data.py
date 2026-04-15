@@ -11,9 +11,38 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 
+# Resolve DATA_DIR once at module level so symlinks are also handled (CWE-22)
+_SAFE_DATA_DIR = os.path.realpath(DATA_DIR)
+
+# Allowlist of permitted data filenames — defense-in-depth against path traversal
+_ALLOWED_FILES = {
+    'inventory.json',
+    'orders.json',
+    'demand_forecasts.json',
+    'backlog_items.json',
+    'spending.json',
+    'transactions.json',
+    'purchase_orders.json',
+}
+
 def load_json_file(filename):
-    """Load data from a JSON file in the data directory"""
-    filepath = os.path.join(DATA_DIR, filename)
+    """Load data from a JSON file in the data directory.
+
+    Raises ValueError if the resolved path escapes DATA_DIR or if the
+    filename is not on the known-good allowlist.
+    """
+    # Layer 1: allowlist check (fast, prevents even attempting a traversal)
+    if filename not in _ALLOWED_FILES:
+        raise ValueError(f"Filename '{filename}' is not an allowed data file.")
+
+    # Layer 2: canonical path confinement — realpath resolves '..' and symlinks
+    filepath = os.path.realpath(os.path.join(_SAFE_DATA_DIR, filename))
+
+    if not filepath.startswith(_SAFE_DATA_DIR + os.sep):
+        raise ValueError(
+            f"Resolved path escapes the data directory."
+        )
+
     with open(filepath, 'r') as f:
         return json.load(f)
 

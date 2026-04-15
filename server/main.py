@@ -1,8 +1,8 @@
 import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
@@ -49,10 +49,15 @@ def apply_filters(items: list, warehouse: Optional[str] = None, category: Option
     return filtered
 
 # CORS middleware - explicit origins required when allow_credentials=True (CWE-942)
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000"
-).split(",")
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS = [origin.strip() for origin in _raw_origins.split(",") if origin.strip()]
+
+# Fail fast: wildcard origin is incompatible with allow_credentials=True
+if "*" in ALLOWED_ORIGINS:
+    raise ValueError(
+        "ALLOWED_ORIGINS must not contain '*' when allow_credentials=True. "
+        "Specify explicit origins (e.g. 'http://localhost:3000')."
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,16 +94,23 @@ class Order(BaseModel):
     category: Optional[str] = None
     source: Optional[str] = None  # "restocking" for orders placed via the Restocking tab
 
+class OrderItem(BaseModel):
+    """Validated schema for individual order line items"""
+    sku: str = Field(min_length=1, max_length=50)
+    name: str = Field(min_length=1, max_length=200)
+    quantity: int = Field(gt=0, le=100_000)
+    unit_price: float = Field(gt=0, le=1_000_000)
+
 class OrderCreate(BaseModel):
-    customer: str
-    items: List[dict]
-    status: str
-    order_date: str
-    expected_delivery: str
-    total_value: float
-    warehouse: Optional[str] = None
-    category: Optional[str] = None
-    source: Optional[str] = None
+    customer: str = Field(min_length=1, max_length=200)
+    items: List[OrderItem] = Field(min_length=1, max_length=100)
+    status: Literal["Processing", "Shipped", "Delivered", "Backordered"]
+    order_date: str = Field(min_length=10, max_length=30, pattern=r"^\d{4}-\d{2}-\d{2}")
+    expected_delivery: str = Field(min_length=10, max_length=30, pattern=r"^\d{4}-\d{2}-\d{2}")
+    total_value: float = Field(gt=0, le=1_000_000_000)
+    warehouse: Optional[str] = Field(default=None, max_length=100)
+    category: Optional[str] = Field(default=None, max_length=100)
+    source: Optional[str] = Field(default=None, max_length=100)
 
 class DemandForecast(BaseModel):
     id: str
@@ -186,7 +198,7 @@ def create_order(order_data: OrderCreate):
     """Create a new order (used by the Restocking tab)"""
     new_id = str(len(orders) + 1)
     order_number = f"RST-{int(datetime.now().timestamp())}"
-    new_order = {"id": new_id, "order_number": order_number, **order_data.dict()}
+    new_order = {"id": new_id, "order_number": order_number, **order_data.model_dump(mode="json")}
     orders.append(new_order)
     return new_order
 
