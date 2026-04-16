@@ -1,8 +1,11 @@
 import os
+import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
@@ -49,10 +52,26 @@ def apply_filters(items: list, warehouse: Optional[str] = None, category: Option
     return filtered
 
 # CORS middleware - explicit origins required when allow_credentials=True (CWE-942)
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000"
-).split(",")
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS = [origin.strip() for origin in _raw_origins.split(",") if origin.strip()]
+
+# Guard: wildcard origin + allow_credentials=True violates CORS spec (CWE-942).
+# Fail fast at startup rather than silently operating in an insecure state.
+if "*" in ALLOWED_ORIGINS:
+    raise RuntimeError(
+        "CORS misconfiguration: ALLOWED_ORIGINS contains '*' but allow_credentials=True. "
+        "Credentialed requests require explicit origins. "
+        "Set ALLOWED_ORIGINS to a comma-separated list of fully-qualified origins "
+        "(e.g. 'https://app.example.com,https://staging.example.com')."
+    )
+
+# Validate that each origin has a proper URL scheme to prevent misconfiguration
+for _origin in ALLOWED_ORIGINS:
+    if not (_origin.startswith("http://") or _origin.startswith("https://")):
+        raise RuntimeError(
+            f"CORS misconfiguration: origin '{_origin}' must start with http:// or https://. "
+            "Each origin must be a fully-qualified URL."
+        )
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +80,35 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "Accept"],
 )
+
+# Security headers middleware (CWE-693) - adds defense-in-depth HTTP headers
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "0"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = (
+            "geolocation=(), microphone=(), camera=(), payment=()"
+        )
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none';"
+        )
+        response.headers["Cache-Control"] = "no-store"
+        # Only set HSTS when the application is served over TLS
+        if os.getenv("HTTPS_ENABLED", "false").lower() == "true":
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=31536000; includeSubDomains"
+            )
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Data models
 class InventoryItem(BaseModel):
@@ -89,16 +137,49 @@ class Order(BaseModel):
     category: Optional[str] = None
     source: Optional[str] = None  # "restocking" for orders placed via the Restocking tab
 
+# Typed sub-model for order items (CWE-20) — replaces untyped List[dict]
+class OrderItem(BaseModel):
+    sku: str = Field(..., min_length=1, max_length=50, pattern=r'^[A-Za-z0-9\-]+$')
+    name: str = Field(..., min_length=1, max_length=200)
+    quantity: int = Field(..., ge=1, le=100_000)
+    unit_price: float = Field(..., ge=0.0, le=1_000_000.0)
+
+VALID_ORDER_STATUSES = {"Pending", "Processing", "Shipped", "Delivered", "Cancelled", "Backordered"}
+VALID_ORDER_SOURCES = {"restocking", "manual", "import"}
+
 class OrderCreate(BaseModel):
-    customer: str
-    items: List[dict]
-    status: str
-    order_date: str
-    expected_delivery: str
-    total_value: float
-    warehouse: Optional[str] = None
-    category: Optional[str] = None
-    source: Optional[str] = None
+    customer: str = Field(..., min_length=1, max_length=255)
+    items: List[OrderItem] = Field(..., min_length=1, max_length=500)
+    status: str = Field(..., min_length=1, max_length=50)
+    order_date: str = Field(..., min_length=10, max_length=30)
+    expected_delivery: str = Field(..., min_length=10, max_length=30)
+    total_value: float = Field(..., ge=0.0, le=1_000_000_000.0)
+    warehouse: Optional[str] = Field(default=None, max_length=100)
+    category: Optional[str] = Field(default=None, max_length=100)
+    source: Optional[str] = Field(default=None, max_length=50)
+
+    @field_validator("status")
+    @classmethod
+    def status_must_be_valid(cls, v: str) -> str:
+        if v not in VALID_ORDER_STATUSES:
+            raise ValueError(f"status must be one of {sorted(VALID_ORDER_STATUSES)}")
+        return v
+
+    @field_validator("source")
+    @classmethod
+    def source_must_be_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_ORDER_SOURCES:
+            raise ValueError(f"source must be one of {sorted(VALID_ORDER_SOURCES)}")
+        return v
+
+    @field_validator("order_date", "expected_delivery")
+    @classmethod
+    def date_must_be_iso8601(cls, v: str) -> str:
+        try:
+            datetime.fromisoformat(v)
+        except ValueError:
+            raise ValueError("date fields must be a valid ISO 8601 string (e.g. 2025-09-15)")
+        return v
 
 class DemandForecast(BaseModel):
     id: str
@@ -184,9 +265,13 @@ def get_order(order_id: str):
 @app.post("/api/orders", response_model=Order, status_code=201)
 def create_order(order_data: OrderCreate):
     """Create a new order (used by the Restocking tab)"""
-    new_id = str(len(orders) + 1)
+    # UUID4 eliminates predictable sequential-int ID collision risk (CWE-20)
+    new_id = str(uuid.uuid4())
     order_number = f"RST-{int(datetime.now().timestamp())}"
-    new_order = {"id": new_id, "order_number": order_number, **order_data.dict()}
+    payload = order_data.model_dump()
+    # Serialize OrderItem sub-models back to dicts for in-memory storage consistency
+    payload["items"] = [item.model_dump() for item in order_data.items]
+    new_order = {"id": new_id, "order_number": order_number, **payload}
     orders.append(new_order)
     return new_order
 
